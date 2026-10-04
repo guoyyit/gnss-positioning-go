@@ -92,7 +92,6 @@ func (l *Link) DeliveryPlan(numEpochs int) []Delivery {
 		if jump, ok := l.cfg.ClockJumps[idx]; ok {
 			ep = cloneEpoch(ep)
 			ep.Epoch = ep.Epoch.Add(secondsDur(jump))
-			flags = append(flags, model.FlagClockJump)
 		}
 
 		deliveries = append(deliveries, Delivery{Epoch: ep, Flags: flags})

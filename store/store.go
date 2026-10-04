@@ -109,6 +109,44 @@ func (s *Store) LastIndex(channel string) int {
 	return st.LastIndex
 }
 
+// AnnotateFlags 向某通道已提交历元的结果幂等地追加质量标记（如重复包在提交之后
+// 才到达）。若该历元尚未提交（仍在通道的乱序容忍窗口内等待），返回 false 且不写入，
+// 由通道在该历元真正提交时再带上标记。Commit 的幂等语义与提交接口均不受影响。
+func (s *Store) AnnotateFlags(channel string, index int, flags ...model.QualityFlag) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	st := s.state[channel]
+	if st == nil {
+		return false
+	}
+	sol, exists := st.Solutions[index]
+	if !exists {
+		return false
+	}
+	changed := false
+	for _, f := range flags {
+		if !qualityFlagPresent(sol.Flags, f) {
+			sol.Flags = append(sol.Flags, f)
+			changed = true
+		}
+	}
+	if !changed {
+		return true
+	}
+	_ = s.flushLocked()
+	return true
+}
+
+func qualityFlagPresent(flags []model.QualityFlag, target model.QualityFlag) bool {
+	for _, f := range flags {
+		if f == target {
+			return true
+		}
+	}
+	return false
+}
+
 // Solution 返回某通道指定历元的已提交结果。
 func (s *Store) Solution(channel string, index int) *model.Solution {
 	s.mu.Lock()

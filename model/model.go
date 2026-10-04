@@ -88,6 +88,7 @@ const (
 	FailureInsufficientGeometry
 	FailureNoConvergence
 	FailureNoUsableSatellites
+	FailureTimeAnomaly
 )
 
 // QualityFlag 为观测链路与解算过程的可区分质量标记。

@@ -52,7 +52,7 @@ func TestLinkAnomalies(t *testing.T) {
 		MissingWhole: map[int]bool{7: true},
 		MissingSats:  map[int][]model.SatID{3: {"G00", "G01", "G02"}},
 		Duplicates:   map[int]int{4: 2},
-		ReorderSwaps: map[int]int{5: 2}, // 5 与 7 交换；7 缺失 => 5 晚到
+		ReorderSwaps: map[int]int{1: 9}, // 1 与 10 交换；10 先到且越窗 => 1 真正晚到
 		ClockJumps:   map[int]float64{6: 1.5},
 	})
 
@@ -84,10 +84,10 @@ func TestLinkAnomalies(t *testing.T) {
 		t.Fatal("epoch 4 missing")
 	}
 	if byIndex[5] == nil {
-		t.Fatal("reordered epoch 5 missing")
+		t.Fatal("epoch 5 missing")
 	}
-	if !solHasFlag(byIndex[5], model.FlagOutOfOrder) {
-		t.Fatalf("expected out-of-order flag on epoch 5, flags=%v", byIndex[5].Flags)
+	if byIndex[1] == nil || !solHasFlag(byIndex[1], model.FlagOutOfOrder) {
+		t.Fatalf("expected out-of-order flag on late epoch 1, flags=%v", byIndex[1].Flags)
 	}
 	if !solHasFlag(byIndex[6], model.FlagClockJump) {
 		t.Fatal("expected clock-jump flag on epoch 6")

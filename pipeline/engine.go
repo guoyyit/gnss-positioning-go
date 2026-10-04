@@ -53,7 +53,7 @@ func (e *Engine) RunPlayback(id string, deliveries []Delivery) []*model.Solution
 		}
 		committed = append(committed, ch.Drain()...)
 	}
-	committed = append(committed, ch.Drain()...)
+	committed = append(committed, ch.FlushEndOfStream()...)
 	return committed
 }
 

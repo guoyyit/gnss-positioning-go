@@ -114,23 +114,60 @@ rho_s = |R_recv - R_sat(tx) · Rz(ωe·τ)|      几何距离（含 Sagnac 旋�
 - `StatusOK`：定位成功且完好性正常。
 - `StatusDegraded`：定位有效但经历故障剔除、RAIM 不可用或保护水平超限。
 - `StatusFailed`：检测到故障却无法安全剔除，或几何/收敛失败；此时不提供定位坐标。
+  所有失败路径的坐标、精度、完好性数值一律清空、故障卫星列表为空，详见
+  “异常观测链路”中的“失败状态的输出清理约定”。
 
 ## 异常观测链路（`pipeline.LinkConfig`）
 
 | 异常 | 配置 | 处理与输出标记 |
 | --- | --- | --- |
-| 整历元缺失 | `MissingWhole` | 链路不投递；通道按乱序容忍窗口确认缺口后提交失败占位，`FlagEpochMissing` |
+| 整历元缺失 | `MissingWhole` | 链路不投递；通道在输入流结束（`FlushEndOfStream`，`Engine.RunPlayback` 已内含）时确认缺口，提交失败占位 `FlagEpochMissing`。流中**不**提前确认缺口——容忍窗口内的迟到包可能恰好填补它 |
 | 部分卫星缺失 | `MissingSats` | 以剩余卫星解算，`FlagObservationMissing` |
-| 重复到达 | `Duplicates` | 通道按序号去重，重复包不重复提交（不产生额外标记，状态不变） |
-| 时间戳乱序 | `ReorderSwaps` | 在容忍窗口内缓冲重排；晚到包带 `FlagOutOfOrder` |
-| 接收机钟跳 | `ClockJumps` 或兜底检测 | 时间戳跳变被标记 `FlagClockJump`，不污染处理游标 |
+| 重复到达 | `Duplicates` | 通道按序号去重，重复包不产生第二个提交结果；该历元最终结果（无论重复包在提交之前还是之后到达）携带 `FlagDuplicateSuppressed`，标记幂等且会修订已落盘结果 |
+| 时间戳乱序 | `ReorderSwaps` | 在容忍窗口内缓冲重排；到达时已见最远序号超出容忍窗口的真正晚到包带 `FlagOutOfOrder`，窗口内顺序打乱由重排吸收、不标记 |
+| 接收机钟跳 | `ClockJumps` 或兜底检测 | 见下方“接收机钟跳处理规则” |
+
+### 接收机钟跳处理规则
+
+- 通道维护一个按**历元序号**（而非到达顺序）建立的标称时间网格，锚点为序号 0
+  对应的标称时间；重启后由最早已提交历元重建，乱序晚到包会校准锚点。
+- 历元严格按序号处理，因此钟跳标记始终归属真实发生跳变的历元，紧邻的后续历元
+  不会被连带标记，正向与负向跳变同理；乱序投递不改变归属。
+- 判定容差为 `Config.ClockJumpTolerance`（纳秒，缺失时默认 `IntervalHint/2`）：
+  加盖时间戳相对标称网格的偏差绝对值超过容差才标记 `FlagClockJump`；容差以内的
+  轻微时间抖动不标记。容差可通过 `Channel.SetClockJumpTolerance` 动态调整，
+  只影响调整之后处理的历元。
+- 时间基准异常不会被误判为卫星故障：解算一律使用该序号对应的标称时间（观测即按
+  真实信号发射时刻构造），钟跳历元仍给出正常噪声水平的可信定位，RAIM 不会把健康
+  卫星列为故障星，也不会触发故障剔除。
+
+### 失败状态的输出清理约定
+
+任何失败历元（几何不足、不收敛、无可用卫星、整历元缺失等**所有**失败路径）输出
+全局一致：
+
+- `Status = StatusFailed`，`FailureReason` 给出可区分原因；
+- 不携带坐标：`PositionECEF`/`Geo`/`ClockBiasM` 全部清零；
+- 不携带精度与完好性识别数值：`Quality` 清零，`Integrity.Statistic/Threshold/
+  DegreesFreedom/HPL/VPL/DriftDetected` 清零，`FaultSatellites` 为空；
+- `Integrity.Status = RAIMUnavailable`（保留 `HAL/VAL` 配置项），明确表示完好性
+  不可用，绝不出现“失败状态 + 数值坐标/故障星列表”并存的结果；
+- 链路标记（`FlagEpochMissing` 等）原样保留；`FailureTimeAnomaly` 预留给
+  “拒绝时间异常定位”的失败路径。
+
+### 标记组合语义
+
+各标记相互独立、互不覆盖，同一历元可同时携带多个标记（如钟跳 + 重复抑制、
+部分缺失 + 乱序）。标记按其实际触发条件幂等追加。
 
 ## 并发与资源边界
 
 - `pipeline.Engine` 支持多通道并发（`go test -race` 验证）；每通道持有独立的处理游标、
-  乱序缓存、去重集合与 RAIM/漂移状态，故障处理互不干扰。
-- 状态**有界**：`pending`/`seen` 仅保留 `ReorderTolerance` 窗口内序号，慢漂移历史长度
-  不超过 `DriftWindow`；内存与计算开销不随历元总数增长（`TestBoundedState`）。
+  乱序缓存、去重集合、时间基准与 RAIM/漂移状态，一个通道的钟跳/重复/乱序不影响其他
+  通道的状态、标记与完好性结论（`TestConcurrentAnomalyIsolation`）。
+- 状态**有界**：`seen`/`committed` 仅保留 `ReorderTolerance` 窗口内序号；`pending`
+  只缓存乱序窗口内尚未按序处理的到达包，在 `Drain`/`FlushEndOfStream` 处理后立即清空；
+  慢漂移历史长度不超过 `DriftWindow`；开销不随历元总数增长（`TestBoundedState`）。
 
 ## 确定性回放与重启恢复
 
@@ -140,6 +177,12 @@ rho_s = |R_recv - R_sat(tx) · Rz(ωe·τ)|      几何距离（含 Sagnac 旋�
 - 结果通过 `store.Store` 原子（临时文件 + rename）GOB 落盘；`Commit` 幂等，重启后
   `NewChannel` 自动从最后已提交序号恢复。未完成历元由调用方按既定策略重放重算，
   已提交历元不会重复提交，也不会跳过（`TestRestartRecomputesPending`）。
+- 历史结果与提交游标**无需迁移**：`Solution` 结构仅新增枚举值（`FailureTimeAnomaly`，
+  追加于枚举末尾），GOB 旧文件可直接读取；观测投递方式（`Ingest`/`Drain`）与提交接口
+  （`Commit`）保持不变，已有调用代码无需修改（提交后重复包的标记修订走新增的
+  `store.AnnotateFlags`，不改变 `Commit` 语义）。
+- 重启后时间基准由最早已提交历元重建，包含钟跳/重复/缺失/乱序的未完成历元重算结果
+  与首次完整计算逐项一致（`TestRestartPendingAnomaliesRecompute`）。
 
 ## 全部可配置项
 
@@ -170,14 +213,20 @@ rho_s = |R_recv - R_sat(tx) · Rz(ωe·τ)|      几何距离（含 Sagnac 旋�
 `simulator.Config`：`Seed`、`StartTime`、`Interval`、`NumEpochs`、`NoiseSigma`、
 `MultipathSigma`、`TropoDelay`、`IonoDelay`、`Faults`（见“误差模型”）。
 
-`pipeline.Config`：`ID`、`IntervalHint`（标称历元间隔，用于钟跳兜底检测）、
-`ReorderTolerance`（乱序容忍窗口）、内嵌 `Position` 与 `RAIM` 配置。
+`pipeline.Config`：`ID`、`IntervalHint`（标称历元间隔，纳秒，用于钟跳检测与标称
+时间网格）、`ReorderTolerance`（乱序容忍窗口，历元数）、`ClockJumpTolerance`
+（钟跳判定容差，纳秒，缺省取 `IntervalHint/2`）、内嵌 `Position` 与 `RAIM` 配置。
+运行期可用 `Channel.SetClockJumpTolerance` 调整容差，仅影响后续历元。
 
 ## 测试覆盖
 
 - 定位精度与失败原因区分：`integration/pvt_test.go`、`integration/failure_test.go`
 - 故障注入与排除（单星/多星/慢漂移、无误报）：`raim/raim_test.go`
 - 观测与时钟异常、确定性回放、并发通道：`pipeline/pipeline_test.go`、`bounded_test.go`
+- 正/负向与连续钟跳、钟跳容差配置与轻微抖动、钟跳+乱序归属、钟跳+缺失+重复标记组合、
+  重复到达（提交前/提交后）、失败输出全局清空、多通道异常隔离、重启重算逐项一致与
+  确定性深比较回放：`pipeline/anomaly_test.go`（`go test -race -count=2` 稳定复现，
+  固定种子、不依赖随机游程）
 - 重启恢复与未完成历元重算：`pipeline/restart_test.go`、`store/store_test.go`
 
 > 说明：这是一个教学/算法演示系统。误差模型、阈值与保护水平采用了简化的解析近似

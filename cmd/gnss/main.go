@@ -43,8 +43,10 @@ func main() {
 	}, receiver, ephs)
 
 	link := pipeline.NewLink(sim, pipeline.LinkConfig{
-		MissingSats: map[int][]model.SatID{2: {"G00"}},
-		Duplicates:  map[int]int{3: 1},
+		MissingWhole: map[int]bool{9: true},
+		MissingSats:  map[int][]model.SatID{2: {"G00"}},
+		Duplicates:   map[int]int{3: 1},
+		ClockJumps:   map[int]float64{6: 1.5},
 	})
 
 	st, err := store.New(*dbPath)
@@ -69,6 +71,12 @@ func main() {
 	fmt.Println("epoch | status | lat(°) lon(°) h(m) | err(m) | PDOP | RAIM | faults | flags")
 	solutions := eng.RunPlayback("demo", link.DeliveryPlan(*epochs))
 	for _, s := range solutions {
+		if s.Status == model.StatusFailed {
+			fmt.Printf("%5d | %6s | %23s | %6s | %4s | %4s | %v | %v\n",
+				s.Index, statusName(s.Status), "-", "-", "-",
+				raimName(s.Integrity.Status), s.Integrity.FaultSatellites, flagNames(s.Flags))
+			continue
+		}
 		errm := math.Hypot(math.Hypot(s.PositionECEF.X-receiver.X, s.PositionECEF.Y-receiver.Y),
 			s.PositionECEF.Z-receiver.Z)
 		fmt.Printf("%5d | %6s | %9.5f %10.5f %8.2f | %6.2f | %4.2f | %4s | %v | %v\n",
