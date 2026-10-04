@@ -12,7 +12,8 @@ type LinkConfig struct {
 	MissingSats  map[int][]model.SatID // 历元内部分卫星观测缺失
 	Duplicates   map[int]int           // 历元重复投递的额外份数
 	ReorderSwaps map[int]int           // 历元与其后第 k 个历元交换投递
-	ClockJumps   map[int]float64       // 从该历元起接收机时间跳变，秒
+	ClockJumps   map[int]float64       // 从该历元起接收机时间基准阶跃（持续生效），秒
+	ClockJitter  map[int]float64       // 仅作用于该历元的一次性轻微时间抖动，秒（不持续）
 }
 
 // Delivery 为链路投递给通道的一个数据包。
@@ -39,11 +40,18 @@ func NewLink(src Source, cfg LinkConfig) *Link {
 
 // DeliveryPlan 返回 numEpochs 个历元的确定性投递序列：
 // 缺失的整历元不出现；缺失部分卫星的历元以 FlagObservationMissing 标记；
-// 重复按配置追加；乱序按交换计划重排；钟跳改变时间戳。
+// 重复按配置追加；乱序按交换计划重排；钟跳为接收机时间基准的持续阶跃，
+// 从该历元起改变时间戳（钟跳标记由接收通道检测并归属，链路不代为标记）。
 func (l *Link) DeliveryPlan(numEpochs int) []Delivery {
 	type item struct {
 		index int
 	}
+	jumpEpochs := make([]int, 0, len(l.cfg.ClockJumps))
+	for k := range l.cfg.ClockJumps {
+		jumpEpochs = append(jumpEpochs, k)
+	}
+	sortInts(jumpEpochs)
+
 	order := make([]int, 0, numEpochs)
 	for i := 0; i < numEpochs; i++ {
 		order = append(order, i)
@@ -89,10 +97,9 @@ func (l *Link) DeliveryPlan(numEpochs int) []Delivery {
 			flags = append(flags, model.FlagObservationMissing)
 		}
 
-		if jump, ok := l.cfg.ClockJumps[idx]; ok {
+		if shift := l.clockShift(idx, jumpEpochs); shift != 0 || l.cfg.ClockJitter[idx] != 0 {
 			ep = cloneEpoch(ep)
-			ep.Epoch = ep.Epoch.Add(secondsDur(jump))
-			flags = append(flags, model.FlagClockJump)
+			ep.Epoch = ep.Epoch.Add(secondsDur(shift + l.cfg.ClockJitter[idx]))
 		}
 
 		deliveries = append(deliveries, Delivery{Epoch: ep, Flags: flags})
@@ -102,6 +109,19 @@ func (l *Link) DeliveryPlan(numEpochs int) []Delivery {
 		}
 	}
 	return deliveries
+}
+
+// clockShift 返回某历元时刻接收机时间基准相对标称时间的总偏移（秒）。
+// ClockJumps 为在该历元发生的阶跃，对该历元及其后所有历元持续生效。
+func (l *Link) clockShift(idx int, jumpEpochs []int) float64 {
+	var shift float64
+	for _, k := range jumpEpochs {
+		if k > idx {
+			break
+		}
+		shift += l.cfg.ClockJumps[k]
+	}
+	return shift
 }
 
 func cloneEpoch(ep *model.EpochObs) *model.EpochObs {

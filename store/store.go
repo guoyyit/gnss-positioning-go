@@ -109,6 +109,33 @@ func (s *Store) LastIndex(channel string) int {
 	return st.LastIndex
 }
 
+// AddFlag 为某通道指定历元的已提交结果追加一个质量标记（幂等）。
+// 该接口不改变提交结构与 GOB 存储格式，历史文件无需迁移即可使用。
+// 历元尚不存在（例如重复包先于任何提交到达）时不做处理并返回 false。
+func (s *Store) AddFlag(channel string, index int, flag model.QualityFlag) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	st := s.state[channel]
+	if st == nil {
+		return false, nil
+	}
+	sol := st.Solutions[index]
+	if sol == nil {
+		return false, nil
+	}
+	for _, f := range sol.Flags {
+		if f == flag {
+			return false, nil
+		}
+	}
+	sol.Flags = append(sol.Flags, flag)
+	if err := s.flushLocked(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // Solution 返回某通道指定历元的已提交结果。
 func (s *Store) Solution(channel string, index int) *model.Solution {
 	s.mu.Lock()
@@ -155,13 +182,16 @@ func (s *Store) flushLocked() error {
 	if s.path == "" {
 		return nil
 	}
+	// 编码独立深拷贝：Store 被多个接收通道并发共享，各通道在自己的锁保护下
+	// 修改结果对象；若直接编码共享快照，会与其他通道的写入形成数据竞争。
+	snap := s.cloneSnapshotLocked()
 	tmp := s.path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
 	enc := gob.NewEncoder(f)
-	if err := enc.Encode(snapshot{Channels: s.state}); err != nil {
+	if err := enc.Encode(snap); err != nil {
 		f.Close()
 		return err
 	}
@@ -173,4 +203,30 @@ func (s *Store) flushLocked() error {
 		return err
 	}
 	return os.Rename(tmp, s.path)
+}
+
+// cloneSnapshotLocked 在 store 锁内构造一份与各通道内存解耦的深拷贝。
+func (s *Store) cloneSnapshotLocked() snapshot {
+	cp := snapshot{Channels: make(map[string]*channelState, len(s.state))}
+	for id, st := range s.state {
+		cst := &channelState{LastIndex: st.LastIndex, Solutions: make(map[int]*model.Solution, len(st.Solutions))}
+		for idx, sol := range st.Solutions {
+			clone := *sol
+			if sol.Flags != nil {
+				clone.Flags = append([]model.QualityFlag(nil), sol.Flags...)
+			}
+			if sol.UsedSats != nil {
+				clone.UsedSats = append([]model.SatID(nil), sol.UsedSats...)
+			}
+			if sol.ExcludedSats != nil {
+				clone.ExcludedSats = append([]model.SatID(nil), sol.ExcludedSats...)
+			}
+			if sol.Integrity.FaultSatellites != nil {
+				clone.Integrity.FaultSatellites = append([]model.SatID(nil), sol.Integrity.FaultSatellites...)
+			}
+			cst.Solutions[idx] = &clone
+		}
+		cp.Channels[id] = cst
+	}
+	return cp
 }

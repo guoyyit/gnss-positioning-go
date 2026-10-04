@@ -34,8 +34,9 @@ go test -race ./...
   DOP/协方差/残差统计、标称传播延迟改正模型。
 - `raim/`：卡方全局一致性检验、单星标准化残差门限、前向搜索多星识别、剔除后重解、
   保护水平（HPL/VPL）、有界窗口慢漂移检测。
-- `pipeline/`：异常观测链路（缺失/重复/乱序/钟跳）、有界接收通道、多通道并发引擎、
-  确定性回放驱动。
+- `pipeline/`：异常观测链路（缺失/重复/乱序/钟跳/轻微抖动）、钟跳按历元有序检测与
+  时间轴校正、重复到达标记、失败结果全局清理、有界接收通道、多通道并发引擎、
+  确定性回放与重启状态重建。
 - `store/`：GOB 原子落盘、按通道幂等提交、重启恢复。
 - `integration/`：跨包端到端测试。
 
@@ -113,7 +114,21 @@ rho_s = |R_recv - R_sat(tx) · Rz(ωe·τ)|      几何距离（含 Sagnac 旋�
 
 - `StatusOK`：定位成功且完好性正常。
 - `StatusDegraded`：定位有效但经历故障剔除、RAIM 不可用或保护水平超限。
-- `StatusFailed`：检测到故障却无法安全剔除，或几何/收敛失败；此时不提供定位坐标。
+- `StatusFailed`：检测到故障却无法安全剔除、几何/收敛失败，或整历元缺失占位。
+
+### 失败状态的输出清理约定（全局一致）
+
+失败历元**不得携带任何坐标、精度数值或完好性识别数值**，杜绝“报告失败却同时给出一套
+明显偏离真值的坐标/把健康星列为故障星”的自相矛盾输出。该约定作用于**所有失败路径**
+（几何不足、不收敛、无可用卫星、检测到故障但无法安全剔除、整历元缺失占位）：
+
+- `PositionECEF`、`Geo`、`ClockBiasM` 清零；
+- `UsedSats`、`ExcludedSats` 置空；
+- `QualityReport` 整体清零（DOP、残差、`Sigma0`、协方差均不输出）；
+- `IntegrityReport.Status = RAIMUnavailable`，`FaultSatellites` 显式置空，
+  `Statistic/Threshold/DegreesFreedom/HPL/VPL/DriftDetected` 清零；
+- `Status`、`FailureReason` 与链路标记（如 `FlagEpochMissing`）照常保留，
+  告警限 `HAL/VAL` 作为配置项保留。
 
 ## 异常观测链路（`pipeline.LinkConfig`）
 
@@ -121,14 +136,51 @@ rho_s = |R_recv - R_sat(tx) · Rz(ωe·τ)|      几何距离（含 Sagnac 旋�
 | --- | --- | --- |
 | 整历元缺失 | `MissingWhole` | 链路不投递；通道按乱序容忍窗口确认缺口后提交失败占位，`FlagEpochMissing` |
 | 部分卫星缺失 | `MissingSats` | 以剩余卫星解算，`FlagObservationMissing` |
-| 重复到达 | `Duplicates` | 通道按序号去重，重复包不重复提交（不产生额外标记，状态不变） |
+| 重复到达 | `Duplicates` | 重复包被抑制、**绝不第二次提交**；对应历元最终结果带 `FlagDuplicateSuppressed` |
 | 时间戳乱序 | `ReorderSwaps` | 在容忍窗口内缓冲重排；晚到包带 `FlagOutOfOrder` |
-| 接收机钟跳 | `ClockJumps` 或兜底检测 | 时间戳跳变被标记 `FlagClockJump`，不污染处理游标 |
+| 接收机钟跳 | `ClockJumps` | 接收机时间基准的持续阶跃；仅跳变发生历元带 `FlagClockJump` |
+| 一次性轻微抖动 | `ClockJitter` | 只作用于单个历元的时间戳抖动；低于容差不标记 |
+
+### 接收机时间异常（钟跳）处理规则
+
+钟跳是**接收机时间基准**的阶跃（正跳/负跳均可），不是卫星故障；观测本身仍在标称历元
+时刻产生，只是接收机加盖的时间戳偏移。通道严格按**历元序号有序**检测（与数据包到达
+顺序无关），规则如下：
+
+- 比较相邻历元打戳增量与标称历元间隔 `IntervalHint`；增量偏差的绝对值**严格大于**
+  容差 `ClockJumpToleranceNS`（默认 `IntervalHint/2`）才判为跳变。
+- 标记**只归属到真正发生跳变的那一个历元**；跳变之后的持续偏移不会连带标记紧邻历元，
+  除非那些历元自身又发生跳变。连续多次跳变会分别标记到各自历元。
+- 低于容差的轻微时间抖动（`ClockJitter`）不判为跳变。
+- 解算时把接收时刻**校正回标称时间轴**（`t0 + 序号·IntervalHint`），卫星几何与残差
+  恢复正常水平，因此钟跳历元给出误差处于正常噪声水平的可信定位；时间异常**不触发**
+  RAIM 故障识别与卫星剔除，健康卫星不会被误判为故障星。
+- 解结果的 `Epoch` 仍保留接收机实际加盖（可能含跳变）的原始时间戳，`FlagClockJump`
+  与解算所用的校正时刻相互独立可追溯。
+- 乱序投递只改变到达顺序，不改变钟跳标记的历元归属。
+
+### 重复到达标记语义
+
+- 通道按历元序号去重：同一序号的第二个及以后的数据包一律抑制，**绝不会被第二次提交**。
+- 无论重复包在该历元提交**之前**还是**之后**到达（哪怕已超出内存乱序窗口），该历元
+  最终提交的结果都带 `FlagDuplicateSuppressed`：
+  - 提交前到达：并入该历元待处理数据，提交时一次性带上标记；
+  - 提交后、乱序窗口内到达：原地补标到已提交结果；
+  - 提交很久之后（超出内存窗口）到达：以持久化提交记录为权威识别为重复并补标，
+    不新增提交（需使用 `store.Store`；新增接口 `Store.AddFlag` 幂等）。
+
+### 标记独立共存
+
+各类标记互相独立、互不覆盖，同一历元可同时携带多个标记（例如钟跳 + 重复抑制、
+钟跳 + 部分缺失、乱序 + 重复）。钟跳标记的归属始终由实际发生跳变的历元决定，
+不因与乱序/缺失/重复叠加而改变或产生误报。
 
 ## 并发与资源边界
 
 - `pipeline.Engine` 支持多通道并发（`go test -race` 验证）；每通道持有独立的处理游标、
-  乱序缓存、去重集合与 RAIM/漂移状态，故障处理互不干扰。
+  乱序缓存、去重集合、时钟基准与 RAIM/漂移状态；一个通道的钟跳、重复到达或卫星故障
+  不影响其他通道的状态、标记与完好性结论。持久化 `Store` 在落盘时编码独立深拷贝，
+  与各通道对结果对象的并发修改解耦，全部并发测试在 `-race` 下通过。
 - 状态**有界**：`pending`/`seen` 仅保留 `ReorderTolerance` 窗口内序号，慢漂移历史长度
   不超过 `DriftWindow`；内存与计算开销不随历元总数增长（`TestBoundedState`）。
 
@@ -138,8 +190,14 @@ rho_s = |R_recv - R_sat(tx) · Rz(ωe·τ)|      几何距离（含 Sagnac 旋�
   （`TestDeterminism`）。对残差的所有求和均按有序卫星列表进行，避免 Go map 随机遍历
   导致的浮点顺序差异。
 - 结果通过 `store.Store` 原子（临时文件 + rename）GOB 落盘；`Commit` 幂等，重启后
-  `NewChannel` 自动从最后已提交序号恢复。未完成历元由调用方按既定策略重放重算，
-  已提交历元不会重复提交，也不会跳过（`TestRestartRecomputesPending`）。
+  `NewChannel` 自动从最后已提交序号恢复。重放时恢复点之前的已提交历元以完全相同的
+  顺序“只重建检测状态”（时钟基准与慢漂移历史），不产生也不重复提交结果；未完成历元
+  按既定策略重算，已提交历元不会重复提交也不会跳过（`TestRestartRecomputesPending`、
+  `TestRestartRecomputeWithAnomalies`）。含钟跳或重复到达的历元在重启重算后，其状态、
+  标记组合与完好性结论与首次计算逐项一致。
+- 历史持久化文件与提交游标**无需迁移**：本次修复只新增配置字段与 `Store.AddFlag`
+  接口，不改变 GOB 结构、观测投递方式（`Ingest`/`DeliveryPlan`）与提交接口
+  （`Commit`/`RunPlayback`/`Resume`），已有调用代码无需修改。
 
 ## 全部可配置项
 
@@ -170,8 +228,19 @@ rho_s = |R_recv - R_sat(tx) · Rz(ωe·τ)|      几何距离（含 Sagnac 旋�
 `simulator.Config`：`Seed`、`StartTime`、`Interval`、`NumEpochs`、`NoiseSigma`、
 `MultipathSigma`、`TropoDelay`、`IonoDelay`、`Faults`（见“误差模型”）。
 
-`pipeline.Config`：`ID`、`IntervalHint`（标称历元间隔，用于钟跳兜底检测）、
-`ReorderTolerance`（乱序容忍窗口）、内嵌 `Position` 与 `RAIM` 配置。
+`pipeline.Config`：
+
+| 字段 | 默认 | 含义 |
+| --- | --- | --- |
+| `ID` | — | 接收通道标识 |
+| `IntervalHint` | 0 | 标称历元间隔（纳秒）；>0 时启用钟跳检测并作为标称时间轴 |
+| `ReorderTolerance` | 0 | 乱序容忍窗口（历元数） |
+| `ClockJumpToleranceNS` | `IntervalHint/2` | 钟跳判定容差（纳秒），<=0 取默认值 |
+| `Position` / `RAIM` | — | 内嵌的解算与完好性配置 |
+
+钟跳容差也可在运行中通过 `Channel.SetClockJumpTolerance(ns)` 修改，变更只影响之后
+处理的历元，不回溯重判。`Store.AddFlag(channel, index, flag)` 为幂等的标记追加接口，
+用于在已提交结果上补“重复到达”等标记，不改变既有提交结构。
 
 ## 测试覆盖
 
@@ -179,6 +248,11 @@ rho_s = |R_recv - R_sat(tx) · Rz(ωe·τ)|      几何距离（含 Sagnac 旋�
 - 故障注入与排除（单星/多星/慢漂移、无误报）：`raim/raim_test.go`
 - 观测与时钟异常、确定性回放、并发通道：`pipeline/pipeline_test.go`、`bounded_test.go`
 - 重启恢复与未完成历元重算：`pipeline/restart_test.go`、`store/store_test.go`
+- 异常观测链路验收：`pipeline/anomaly_test.go`，覆盖
+  正向/负向/连续钟跳、容差内轻微抖动不误报、可配置容差、
+  失败历元全局清理、重复到达在提交前/提交后/持久化迟到三种时序、
+  钟跳与乱序/缺失/重复的标记独立共存、多通道并发隔离（`-race`）、
+  含异常的确定性回放与重启重算逐项一致（不依赖随机游程）。
 
 > 说明：这是一个教学/算法演示系统。误差模型、阈值与保护水平采用了简化的解析近似
 > （如 1/sin 仰角映射、Wilson–Hilferty 卡方分位、协方差对角化保护水平），并非适航级
